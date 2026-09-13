@@ -1214,7 +1214,7 @@ Screenshots hide native scrollbars by default for agent-browser-style stable evi
 
 ```bash
 --config <path>                 # Use a custom config file
---session <uuid>                # Target an existing live session id
+--session <uuid>                # Target a live id, or use matching PI_SESSION_ID as a lifecycle key
 --session <name>                # Select an isolated ephemeral live session
 --namespace <name>              # Namespace sessions, temp roots, and restore state
 --session-name <name>           # Deprecated alias: --session <name> --restore <name>

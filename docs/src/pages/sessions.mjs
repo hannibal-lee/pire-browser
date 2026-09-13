@@ -15,7 +15,7 @@ pire-browser --session work close
 pire-browser session list
 pire-browser session info --json
 pire-browser --session <uuid> snapshot -i`),
-  p("<code>open</code> selects the <code>default</code> session. <code>--session &lt;name&gt;</code> selects an isolated live browser but does not make its Firefox profile durable. New profiles and default downloads live under the OS temporary directory and are removed after close. UUID targets refer only to an existing live session."),
+  p("<code>open</code> selects the <code>default</code> session. <code>--session &lt;name&gt;</code> selects an isolated live browser but does not make its Firefox profile durable. New profiles and default downloads live under the OS temporary directory and are removed after close. UUID targets refer only to an existing live session, except when the UUID exactly matches <code>PI_SESSION_ID</code>; that value is the current Pi lifecycle key and can launch an isolated session."),
 
   h2("Compact restore", "compact-restore"),
   code(`SESSION="$(pire-browser session id --scope worktree --prefix my-app)"
