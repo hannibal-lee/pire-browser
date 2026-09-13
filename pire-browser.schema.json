@@ -17,7 +17,7 @@
     "session": {
       "type": "string",
       "pattern": "^[A-Za-z0-9_-]+$",
-      "description": "Default isolated live session name or strict live UUID."
+      "description": "Default isolated live session name, current PI_SESSION_ID lifecycle key, or strict live UUID."
     },
     "namespace": {
       "type": "string",

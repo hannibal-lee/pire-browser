@@ -482,7 +482,7 @@ pire-browser setcontent '<main><h1>Hello</h1></main>'`),
 
   h2("Global options", "global-options"),
   code(`--config <path>               # Load an explicit pire-browser config file
---session <uuid>              # Target an existing live session id
+--session <uuid>              # Target a live id, or use matching PI_SESSION_ID as a lifecycle key
 --session <name>              # Select an isolated ephemeral live session
 --namespace <name>            # Namespace sessions, temp roots, and restore state
 --session-name <name>         # Deprecated session-plus-restore alias

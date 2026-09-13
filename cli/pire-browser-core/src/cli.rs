@@ -3032,10 +3032,25 @@ fn set_session_id_or_name(
     session_name: &mut Option<String>,
     value: String,
 ) -> Result<()> {
+    let pi_session_id = env::var("PI_SESSION_ID").ok();
+    set_session_id_or_name_with_pi_session_id(
+        session_id,
+        session_name,
+        value,
+        pi_session_id.as_deref(),
+    )
+}
+
+fn set_session_id_or_name_with_pi_session_id(
+    session_id: &mut Option<String>,
+    session_name: &mut Option<String>,
+    value: String,
+    pi_session_id: Option<&str>,
+) -> Result<()> {
     if session_id.is_some() || session_name.is_some() {
         bail!("--session was provided more than once or mixed with --session-name");
     }
-    if looks_like_session_id(&value) {
+    if looks_like_session_id(&value) && pi_session_id != Some(value.as_str()) {
         *session_id = Some(value);
     } else {
         *session_name = Some(value);
@@ -4753,8 +4768,10 @@ directory.
 Set PIRE_BROWSER_REQUIRE_INSPECTED_STATE=1 to make normal `state load` require
 that receipt; use `--no-require-inspected` only as an explicit cooperative
 operator override.
-`--session <uuid>` is strict live-id targeting. `--session <name> state load`
-can launch an ephemeral session at the saved display URL when no matching live
+`--session <uuid>` is strict live-id targeting unless the value exactly matches
+PI_SESSION_ID; the current Pi UUID is then a named lifecycle key that can launch
+and restore an isolated session. `--session <name> state load` can launch an
+ephemeral session at the saved display URL when no matching live
 session exists. `--auto-connect state save` saves from the selected live
 session. `--state <path> <command>` preloads saved state before the requested
 browser command. Active
@@ -4821,7 +4838,9 @@ QA loops.
 `cwd` uses the current directory; `global` returns the sanitized prefix without
 a path hash.
 
-`--session <uuid>` is strict live-id targeting. `--session <name>` selects an
+`--session <uuid>` is strict live-id targeting unless it exactly matches
+PI_SESSION_ID, in which case it is the current Pi lifecycle key and may launch
+an isolated session. `--session <name>` selects an
 isolated live session with an ephemeral Firefox profile. `--restore [key]`
 auto-loads and saves cookies plus origin-keyed localStorage; the key defaults to
 the session name. `--session-name <name>` is a deprecated alias for `--session
@@ -6042,6 +6061,44 @@ mod tests {
                 args: s(&["snapshot", "-i"])
             }
         );
+    }
+
+    #[test]
+    fn treats_the_current_pi_uuid_as_a_named_session_key() {
+        let value = "4d4884fc-af4f-498c-a3f1-16f7bc91a738";
+        let mut session_id = None;
+        let mut session_name = None;
+
+        set_session_id_or_name_with_pi_session_id(
+            &mut session_id,
+            &mut session_name,
+            value.to_string(),
+            Some(value),
+        )
+        .unwrap();
+
+        assert_eq!(session_id, None);
+        assert_eq!(session_name.as_deref(), Some(value));
+    }
+
+    #[test]
+    fn keeps_other_uuids_as_strict_live_session_ids() {
+        let mut session_id = None;
+        let mut session_name = None;
+
+        set_session_id_or_name_with_pi_session_id(
+            &mut session_id,
+            &mut session_name,
+            "4d4884fc-af4f-498c-a3f1-16f7bc91a738".to_string(),
+            Some("12f67589-adc5-4d11-b635-12eec91e0d99"),
+        )
+        .unwrap();
+
+        assert_eq!(
+            session_id.as_deref(),
+            Some("4d4884fc-af4f-498c-a3f1-16f7bc91a738")
+        );
+        assert_eq!(session_name, None);
     }
 
     #[test]
