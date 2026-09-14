@@ -24,16 +24,20 @@ vi.mock("typebox", () => ({
   },
 }));
 
-import registerPireBrowser from "./pire-browser";
+import registerPireBrowser, { scopeCommandToPiSession } from "./pire-browser";
 
 function registerTool() {
   const tools: any[] = [];
+  const handlers = new Map<string, (...args: any[]) => any>();
   registerPireBrowser({
     registerTool(tool: any) {
       tools.push(tool);
     },
+    on(event: string, handler: (...args: any[]) => any) {
+      handlers.set(event, handler);
+    },
   } as any);
-  return tools[0];
+  return { tool: tools[0], handlers };
 }
 
 describe("pire-browser Pi wrapper", () => {
@@ -47,7 +51,7 @@ describe("pire-browser Pi wrapper", () => {
   });
 
   it("keeps inline prompt guidance compact and points to installed skill content", () => {
-    const tool = registerTool();
+    const { tool } = registerTool();
     expect(tool.promptSnippet).toContain("pire-browser skills get core");
     expect(tool.promptGuidelines).toContain(
       "Run `pire-browser skills get core` for quickstart recipes; use `pire-browser open` with no URL to launch or reuse Firefox before staging state, cookies, routes, or init scripts."
@@ -72,7 +76,7 @@ describe("pire-browser Pi wrapper", () => {
       recovered: false,
     });
 
-    const tool = registerTool();
+    const { tool } = registerTool();
     await tool.execute("call-1", { command: "status" }, new AbortController().signal);
     const second = await tool.execute("call-2", { command: "snapshot" }, new AbortController().signal);
 
@@ -107,7 +111,7 @@ describe("pire-browser Pi wrapper", () => {
       },
     });
 
-    const tool = registerTool();
+    const { tool } = registerTool();
     const result = await tool.execute(
       "call-1",
       { command: "open https://example.test/?access_token=command-secret" },
@@ -131,7 +135,7 @@ describe("pire-browser Pi wrapper", () => {
       recovered: false,
     });
 
-    const tool = registerTool();
+    const { tool } = registerTool();
     const result = await tool.execute("call-1", { command: "open https://example.test" }, new AbortController().signal);
 
     expect(result.content[0].text).toBe("command failed");
@@ -148,7 +152,7 @@ describe("pire-browser Pi wrapper", () => {
       recovered: true,
     });
 
-    const tool = registerTool();
+    const { tool } = registerTool();
     const result = await tool.execute("call-1", { command: "open https://example.test" }, new AbortController().signal);
 
     expect(result.isError).toBe(false);
@@ -165,10 +169,79 @@ describe("pire-browser Pi wrapper", () => {
       recovered: false,
     });
 
-    const tool = registerTool();
+    const { tool } = registerTool();
     const result = await tool.execute("call-1", { command: "click '@e1'" }, new AbortController().signal);
 
     expect(result.isError).toBe(false);
     expect(result.content[0].text).toContain("ConfirmationRequired");
+  });
+
+  it("binds browser commands to the current Pi session", () => {
+    expect(scopeCommandToPiSession(["open", "https://example.test"], "pi-session")).toEqual({
+      args: ["--session", "pi-session", "open", "https://example.test"],
+      usesCurrentSession: true,
+      closesCurrentSession: false,
+    });
+    expect(scopeCommandToPiSession(["status", "--json"], "pi-session")).toEqual({
+      args: ["status", "--json"],
+      usesCurrentSession: false,
+      closesCurrentSession: false,
+    });
+  });
+
+  it("does not take ownership of an explicitly targeted session", () => {
+    expect(scopeCommandToPiSession(["--session", "other", "snapshot"], "pi-session")).toEqual({
+      args: ["--session", "other", "snapshot"],
+      usesCurrentSession: false,
+      closesCurrentSession: false,
+    });
+  });
+
+  it("closes the Pi-owned Firefox session during session shutdown", async () => {
+    runMock.mockResolvedValue({
+      stdout: "ok",
+      stderr: "",
+      exitCode: 0,
+      finishReason: "close",
+      timedOut: false,
+      recovered: false,
+    });
+    const { tool, handlers } = registerTool();
+    handlers.get("session_start")?.({}, { sessionManager: { getSessionId: () => "pi-session" } });
+
+    await tool.execute("call-1", { command: "snapshot" }, new AbortController().signal);
+    await handlers.get("session_shutdown")?.({}, {});
+
+    expect(runMock).toHaveBeenNthCalledWith(
+      1,
+      expect.any(String),
+      expect.arrayContaining(["--session", "pi-session", "snapshot"]),
+      expect.any(AbortSignal)
+    );
+    expect(runMock).toHaveBeenNthCalledWith(
+      2,
+      expect.any(String),
+      expect.arrayContaining(["--session", "pi-session", "close"]),
+      expect.any(AbortSignal),
+      { toolTimeoutMs: 10_000 }
+    );
+  });
+
+  it("does not close again after the tool explicitly closed the Pi session", async () => {
+    runMock.mockResolvedValue({
+      stdout: "closed",
+      stderr: "",
+      exitCode: 0,
+      finishReason: "close",
+      timedOut: false,
+      recovered: false,
+    });
+    const { tool, handlers } = registerTool();
+    handlers.get("session_start")?.({}, { sessionManager: { getSessionId: () => "pi-session" } });
+
+    await tool.execute("call-1", { command: "close" }, new AbortController().signal);
+    await handlers.get("session_shutdown")?.({}, {});
+
+    expect(runMock).toHaveBeenCalledTimes(1);
   });
 });

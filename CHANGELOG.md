@@ -8,6 +8,7 @@
 
 ## 0.3.0-beta.1
 
+- Scopes Pi browser commands to the current Pi session and closes the managed Firefox session during Pi shutdown, reload, fork, and session switches.
 - Makes ordinary and named Firefox sessions ephemeral, with marker-validated cleanup and temporary default downloads.
 - Adds namespaced compact restore for all cookies plus origin-keyed `localStorage`, including idle/close autosave, validation guards, expiry, and optional AES-256-GCM encryption.
 - Splits profile behavior into temporary snapshots for named Firefox sources and intentionally durable explicit profile paths, while preserving 0.2.x profiles with usage, cache-clean, and confirmed delete tools.
