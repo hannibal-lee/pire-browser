@@ -46,6 +46,8 @@ Then ask Pi to use the tool:
 Use pire-browser to open https://example.com and snapshot the page.
 ```
 
+The Pi extension automatically scopes browser commands to the current Pi session. When Pi quits, reloads, forks, or switches sessions, the extension closes the managed Firefox session it opened; sessions explicitly targeted with another `--session` value remain caller-owned.
+
 If Pi/npm prints an `allow-scripts` warning during install, continue with the
 first tool use. Browser commands can run lazy setup when Native Messaging
 registration is missing. Use the repair steps below only if the first browser

@@ -16,8 +16,48 @@ const PireBrowserParams = Type.Object({
 
 type PireBrowserInput = Static<typeof PireBrowserParams>;
 let smokePiToolCallCount = 0;
+const SESSIONLESS_COMMANDS = new Set([
+  "activity",
+  "completion",
+  "dashboard",
+  "doctor",
+  "help",
+  "install",
+  "install-status",
+  "mcp",
+  "plugin",
+  "profiles",
+  "session",
+  "skill",
+  "skills",
+  "status",
+  "stream",
+  "version",
+]);
+const SESSION_CLOSE_TIMEOUT_MS = 10_000;
 
 export default function (pi: ExtensionAPI) {
+  let piSessionId: string | undefined;
+  let currentSessionWasUsed = false;
+
+  pi.on("session_start", (_event, ctx) => {
+    piSessionId = ctx.sessionManager.getSessionId();
+    currentSessionWasUsed = false;
+  });
+
+  pi.on("session_shutdown", async () => {
+    const sessionId = piSessionId;
+    piSessionId = undefined;
+    if (!sessionId || !currentSessionWasUsed) return;
+
+    currentSessionWasUsed = false;
+    const command = resolveCommand();
+    const controller = new AbortController();
+    await run(command.executable, [...command.args, "--session", sessionId, "close"], controller.signal, {
+      toolTimeoutMs: SESSION_CLOSE_TIMEOUT_MS,
+    });
+  });
+
   const register = (name: "pire-browser" | "pire_browser") =>
     pi.registerTool({
       name,
@@ -41,8 +81,10 @@ export default function (pi: ExtensionAPI) {
         const limited = enforcePiToolCallLimit(params.command);
         if (limited) return limited;
         const command = resolveCommand();
-        const args = splitCommand(params.command);
-        const result = await run(command.executable, [...command.args, ...args], signal);
+        const scoped = scopeCommandToPiSession(splitCommand(params.command), piSessionId);
+        if (scoped.usesCurrentSession) currentSessionWasUsed = true;
+        const result = await run(command.executable, [...command.args, ...scoped.args], signal);
+        if (scoped.closesCurrentSession && !result.exitCode && !result.timedOut) currentSessionWasUsed = false;
         const stderr = redactDiagnosticText(result.stderr);
         const text = result.stdout || stderr || "pire-browser command completed with no output";
         const isError = isErroredResult(text, result);
@@ -92,6 +134,42 @@ export default function (pi: ExtensionAPI) {
   } catch {
     register("pire_browser");
   }
+}
+
+export function scopeCommandToPiSession(args: string[], piSessionId?: string) {
+  if (!piSessionId || isSessionlessCommand(args)) {
+    return { args, usesCurrentSession: false, closesCurrentSession: false };
+  }
+
+  const explicitSession = explicitSessionTarget(args);
+  if (explicitSession) {
+    const usesCurrentSession = explicitSession === piSessionId;
+    return {
+      args,
+      usesCurrentSession,
+      closesCurrentSession: usesCurrentSession && isCloseCommand(args),
+    };
+  }
+
+  return {
+    args: ["--session", piSessionId, ...args],
+    usesCurrentSession: true,
+    closesCurrentSession: isCloseCommand(args),
+  };
+}
+
+function explicitSessionTarget(args: string[]) {
+  const index = args.findIndex((arg) => arg === "--session" || arg === "--session-name");
+  return index >= 0 ? args[index + 1] : undefined;
+}
+
+function isSessionlessCommand(args: string[]) {
+  const command = args.find((arg) => !arg.startsWith("-"));
+  return command ? SESSIONLESS_COMMANDS.has(command) : true;
+}
+
+function isCloseCommand(args: string[]) {
+  return args.some((arg) => arg === "close" || arg === "quit" || arg === "exit");
 }
 
 export function isConfirmationRequiredResult(
