@@ -322,6 +322,23 @@ describe("pire-browser session remnant cleanup", () => {
     expect(result.killed).toEqual([]);
     rmSync(root, { recursive: true, force: true });
   });
+
+  it("survives an unavailable process list", async () => {
+    const root = mkdtempSync(join(tmpdir(), "pire-remnants-nops-"));
+    const sessionDir = join(root, "session-3");
+    const profile = join(sessionDir, "profile");
+    mkdirSync(profile, { recursive: true });
+
+    const result = await terminateSessionRemnants(profile, {
+      listProcesses: () => {
+        throw new Error("ps failed");
+      },
+    });
+
+    expect(result.killed).toEqual([]);
+    expect(existsSync(sessionDir)).toBe(false);
+    rmSync(root, { recursive: true, force: true });
+  });
 });
 
 describe("pire-browser stale session reaper", () => {
@@ -410,6 +427,23 @@ describe("pire-browser stale session reaper", () => {
 
     expect(result).toEqual({ removed: [], killed: [] });
     expect(existsSync(stale)).toBe(true);
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  it("still reaps directories when the process list is unavailable", async () => {
+    const { root, sessions } = fixture();
+    const stale = makeSession(sessions, "stale-no-process-list");
+
+    const result = await reapStaleBrowserSessions({
+      sessionsRoot: root,
+      listLiveProfiles: async () => [],
+      listProcesses: () => {
+        throw new Error("ps failed");
+      },
+    });
+
+    expect(result.killed).toEqual([]);
+    expect(result.removed).toEqual([stale]);
     rmSync(root, { recursive: true, force: true });
   });
 
