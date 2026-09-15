@@ -5,7 +5,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -1061,6 +1061,31 @@ pub fn sweep_ephemeral_profiles(force: bool, now: u64) -> EphemeralProfileReport
     report
 }
 
+fn unowned_ephemeral_root_is_reapable(path: &Path, now: u64) -> bool {
+    let Ok(metadata) = fs::symlink_metadata(path) else {
+        return false;
+    };
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return false;
+    }
+    // Only directories that still look like an owned session root are reaped, so
+    // unrelated content below a namespace directory is never deleted.
+    let profile_path = path.join("profile");
+    if !profile_path.is_dir() {
+        return false;
+    }
+    let modified_ms = metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(now);
+    if now.saturating_sub(modified_ms) < EPHEMERAL_ORPHAN_GRACE_MS {
+        return false;
+    }
+    !profile_processes_are_alive(&profile_path)
+}
+
 fn inspect_or_sweep_ephemeral_profiles(remove: bool, now: u64) -> EphemeralProfileReport {
     let root = env::temp_dir().join("pire-browser");
     let mut report = EphemeralProfileReport {
@@ -1090,6 +1115,18 @@ fn inspect_or_sweep_ephemeral_profiles(remove: bool, now: u64) -> EphemeralProfi
             let marker = match read_owned_ephemeral_marker(&path) {
                 Ok(marker) => marker,
                 Err(error) => {
+                    // A session directory can lose its ownership marker when a run is
+                    // interrupted, and removal of the marker used to happen before the
+                    // directory itself was removed. Those leftovers are still safe to
+                    // reap, so classify them as orphans instead of unactionable errors.
+                    if unowned_ephemeral_root_is_reapable(&path, now) {
+                        report.orphaned += 1;
+                        report.bytes = report.bytes.saturating_add(directory_size(&path));
+                        if remove && fs::remove_dir_all(&path).is_ok() {
+                            report.removed += 1;
+                        }
+                        continue;
+                    }
                     report.errors.push(error.to_string());
                     continue;
                 }
@@ -1905,7 +1942,17 @@ fn should_skip_profile_import_entry(relative: &Path, is_dir: bool) -> bool {
             | "compatibility.ini"
             | "sessioncheckpoints.json"
             | "xulstore.json.tmp"
+            | "sessionstore.jsonlz4"
+            | "favicons.sqlite"
+            | "favicons.sqlite-wal"
+            | "favicons.sqlite-shm"
     ) {
+        return true;
+    }
+    // Cache API and other per-origin caches are regenerated and are usually the
+    // largest part of a profile, so snapshots skip them while keeping IndexedDB
+    // and localStorage that carry extension and login state.
+    if is_dir && lower == "cache" && relative.starts_with("storage") {
         return true;
     }
     if is_dir
@@ -1921,6 +1968,12 @@ fn should_skip_profile_import_entry(relative: &Path, is_dir: bool) -> bool {
                 | "shader-cache"
                 | "thumbnails"
                 | "safebrowsing"
+                | "security_state"
+                | "bookmarkbackups"
+                | "sessionstore-backups"
+                | "gmp-widevinecdm"
+                | "gmp-gmpopenh264"
+                | "temporary"
         )
     {
         return true;
@@ -2824,6 +2877,26 @@ mod tests {
     }
 
     #[test]
+    fn unmarked_ephemeral_roots_are_reapable_after_the_grace_period() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("session");
+        fs::create_dir_all(root.join("profile")).unwrap();
+
+        let now = now_ms();
+        // Fresh directory: still inside the grace period, so never reaped.
+        assert!(!unowned_ephemeral_root_is_reapable(&root, now));
+
+        // A stale directory without an ownership marker is a removable orphan.
+        let stale = now + EPHEMERAL_ORPHAN_GRACE_MS + 60_000;
+        assert!(unowned_ephemeral_root_is_reapable(&root, stale));
+
+        // Anything that does not look like a session root is left alone.
+        let unrelated = temp.path().join("not-a-session");
+        fs::create_dir_all(&unrelated).unwrap();
+        assert!(!unowned_ephemeral_root_is_reapable(&unrelated, stale));
+    }
+
+    #[test]
     fn ephemeral_content_cleanup_preserves_ownership_marker_for_retries() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("session");
@@ -3326,15 +3399,24 @@ Path={}
         let root = tempfile::tempdir().unwrap();
         let source = root.path().join("source");
         let destination = root.path().join("destination");
-        fs::create_dir_all(source.join("storage/default/app")).unwrap();
+        fs::create_dir_all(source.join("storage/default/app/idb")).unwrap();
+        fs::create_dir_all(source.join("storage/default/example.com/cache")).unwrap();
         fs::create_dir_all(source.join("cache2")).unwrap();
         fs::create_dir_all(source.join("jumpListCache")).unwrap();
+        fs::create_dir_all(source.join("security_state")).unwrap();
+        fs::create_dir_all(source.join("extensions")).unwrap();
         fs::write(source.join("prefs.js"), b"prefs").unwrap();
         fs::write(source.join("cookies.sqlite"), b"cookies").unwrap();
         fs::write(source.join("parent.lock"), b"locked").unwrap();
+        fs::write(source.join("favicons.sqlite"), b"favicons").unwrap();
+        fs::write(source.join("sessionstore.jsonlz4"), b"tabs").unwrap();
         fs::write(source.join("storage/default/app/state.sqlite"), b"state").unwrap();
+        fs::write(source.join("storage/default/app/idb/state.sqlite"), b"idb").unwrap();
+        fs::write(source.join("storage/default/example.com/cache/entry"), b"cache").unwrap();
         fs::write(source.join("cache2/ignored"), b"cache").unwrap();
         fs::write(source.join("jumpListCache/ignored"), b"jump").unwrap();
+        fs::write(source.join("security_state/ignored"), b"hsts").unwrap();
+        fs::write(source.join("extensions/keep.xpi"), b"xpi").unwrap();
 
         let mut copied = 0usize;
         let mut skipped = 0usize;
@@ -3347,16 +3429,26 @@ Path={}
         )
         .unwrap();
 
-        assert_eq!(copied, 3);
-        assert_eq!(skipped, 3);
+        assert_eq!(copied, 5);
+        assert_eq!(skipped, 7);
         assert_eq!(fs::read(destination.join("prefs.js")).unwrap(), b"prefs");
         assert_eq!(
             fs::read(destination.join("storage/default/app/state.sqlite")).unwrap(),
             b"state"
         );
+        // IndexedDB and installed extensions carry login and 1Password state.
+        assert_eq!(
+            fs::read(destination.join("storage/default/app/idb/state.sqlite")).unwrap(),
+            b"idb"
+        );
+        assert_eq!(fs::read(destination.join("extensions/keep.xpi")).unwrap(), b"xpi");
         assert!(!destination.join("parent.lock").exists());
         assert!(!destination.join("cache2").exists());
         assert!(!destination.join("jumpListCache").exists());
+        assert!(!destination.join("security_state").exists());
+        assert!(!destination.join("favicons.sqlite").exists());
+        assert!(!destination.join("sessionstore.jsonlz4").exists());
+        assert!(!destination.join("storage/default/example.com/cache").exists());
     }
 
     #[test]
