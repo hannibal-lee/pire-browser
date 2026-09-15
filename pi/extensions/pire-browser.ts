@@ -51,7 +51,7 @@ export default function (pi: ExtensionAPI) {
   pi.on("session_start", (_event, ctx) => {
     piSessionId = ctx.sessionManager.getSessionId();
     currentSessionWasUsed = false;
-    void reapStaleBrowserSessions();
+    void reapStaleBrowserSessions().catch(() => undefined);
   });
 
   pi.on("session_shutdown", async () => {
@@ -60,21 +60,27 @@ export default function (pi: ExtensionAPI) {
     currentSessionWasUsed = false;
     if (!sessionId) return;
 
-    // Capture our own profile path before closing: `close` deregisters the
-    // session and can leave Firefox running, and afterwards the path is gone
-    // from the live registry.
-    const ownedProfile = await ownedSessionProfilePath(sessionId);
+    // Cleanup must never block or break Pi shutdown, so every step is guarded.
+    try {
+      // Capture our own profile path before closing: `close` deregisters the
+      // session and can leave Firefox running, and afterwards the path is gone
+      // from the live registry.
+      const ownedProfile = await ownedSessionProfilePath(sessionId);
 
-    // Unconditional cleanup: closing a session that was never created is a safe
-    // no-op, and this extension cannot observe browser work done outside its tool.
-    const command = resolveCommand();
-    const controller = new AbortController();
-    await run(command.executable, [...command.args, "--session", sessionId, "close"], controller.signal, {
-      toolTimeoutMs: SESSION_CLOSE_TIMEOUT_MS,
-    });
+      // Unconditional cleanup: closing a session that was never created is a
+      // safe no-op, and this extension cannot observe browser work done through
+      // bash or another host.
+      const command = resolveCommand();
+      const controller = new AbortController();
+      await run(command.executable, [...command.args, "--session", sessionId, "close"], controller.signal, {
+        toolTimeoutMs: SESSION_CLOSE_TIMEOUT_MS,
+      });
 
-    if (ownedProfile) await terminateSessionRemnants(ownedProfile);
-    await reapStaleBrowserSessions();
+      if (ownedProfile) await terminateSessionRemnants(ownedProfile);
+      await reapStaleBrowserSessions();
+    } catch {
+      // Best effort: leftover cleanup is retried on the next session start.
+    }
   });
 
   const register = (name: "pire-browser" | "pire_browser") =>
@@ -239,7 +245,7 @@ export async function reapStaleBrowserSessions(options: ReaperOptions = {}) {
   const remove = options.removeDirectory ?? ((path: string) => rmSync(path, { recursive: true, force: true }));
   const staleProfiles = staleDirectories.map((directory) => join(directory, "profile"));
 
-  for (const entry of (options.listProcesses ?? listProcesses)()) {
+  for (const entry of listProcessesSafely(options.listProcesses)) {
     if (entry.pid === process.pid) continue;
     if (!staleProfiles.some((profile) => entry.command.includes(profile))) continue;
     try {
@@ -331,7 +337,7 @@ export async function terminateSessionRemnants(profilePath: string, options: Rea
   const killed: number[] = [];
   const kill = options.killProcess ?? terminateProcess;
 
-  for (const entry of (options.listProcesses ?? listProcesses)()) {
+  for (const entry of listProcessesSafely(options.listProcesses)) {
     if (entry.pid === process.pid) continue;
     if (!entry.command.includes(profilePath)) continue;
     try {
@@ -377,6 +383,15 @@ function readDirectoryNames(path: string) {
 function defaultSessionsRoot() {
   if (process.platform !== "darwin" && process.platform !== "linux") return undefined;
   return join(tmpdir(), "pire-browser");
+}
+
+function listProcessesSafely(source?: () => Array<{ pid: number; command: string }>) {
+  try {
+    return (source ?? listProcesses)();
+  } catch {
+    // Without a process view nothing is terminated; directories are still reaped.
+    return [];
+  }
 }
 
 function listProcesses() {
