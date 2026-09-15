@@ -1,3 +1,6 @@
+import { existsSync, mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const runMock = vi.hoisted(() => vi.fn());
@@ -24,7 +27,11 @@ vi.mock("typebox", () => ({
   },
 }));
 
-import registerPireBrowser, { scopeCommandToPiSession } from "./pire-browser";
+import registerPireBrowser, {
+  reapStaleBrowserSessions,
+  scopeCommandToPiSession,
+  terminateSessionRemnants,
+} from "./pire-browser";
 
 function registerTool() {
   const tools: any[] = [];
@@ -44,10 +51,14 @@ describe("pire-browser Pi wrapper", () => {
   beforeEach(() => {
     runMock.mockReset();
     delete process.env.PIRE_BROWSER_PI_MAX_TOOL_CALLS;
+    delete process.env.PIRE_BROWSER_PI_DISABLE_REAPER;
+    process.env.PIRE_BROWSER_SESSIONS_ROOT = join(tmpdir(), `pire-no-sessions-${process.pid}`);
   });
 
   afterEach(() => {
     delete process.env.PIRE_BROWSER_PI_MAX_TOOL_CALLS;
+    delete process.env.PIRE_BROWSER_PI_DISABLE_REAPER;
+    delete process.env.PIRE_BROWSER_SESSIONS_ROOT;
   });
 
   it("keeps inline prompt guidance compact and points to installed skill content", () => {
@@ -212,14 +223,12 @@ describe("pire-browser Pi wrapper", () => {
     await tool.execute("call-1", { command: "snapshot" }, new AbortController().signal);
     await handlers.get("session_shutdown")?.({}, {});
 
-    expect(runMock).toHaveBeenNthCalledWith(
-      1,
+    expect(runMock).toHaveBeenCalledWith(
       expect.any(String),
       expect.arrayContaining(["--session", "pi-session", "snapshot"]),
       expect.any(AbortSignal)
     );
-    expect(runMock).toHaveBeenNthCalledWith(
-      2,
+    expect(runMock).toHaveBeenCalledWith(
       expect.any(String),
       expect.arrayContaining(["--session", "pi-session", "close"]),
       expect.any(AbortSignal),
@@ -227,7 +236,7 @@ describe("pire-browser Pi wrapper", () => {
     );
   });
 
-  it("does not close again after the tool explicitly closed the Pi session", async () => {
+  it("issues the close command on shutdown even after an explicit in-tool close", async () => {
     runMock.mockResolvedValue({
       stdout: "closed",
       stderr: "",
@@ -242,6 +251,184 @@ describe("pire-browser Pi wrapper", () => {
     await tool.execute("call-1", { command: "close" }, new AbortController().signal);
     await handlers.get("session_shutdown")?.({}, {});
 
-    expect(runMock).toHaveBeenCalledTimes(1);
+    // Closing an already-closed session is a documented no-op, so shutting down
+    // always issues close instead of trying to track usage it cannot observe.
+    const closeCalls = runMock.mock.calls.filter((call) => call[1]?.includes("close"));
+    expect(closeCalls.length).toBeGreaterThanOrEqual(2);
+    expect(runMock).toHaveBeenLastCalledWith(
+      expect.any(String),
+      expect.arrayContaining(["--session", "pi-session", "close"]),
+      expect.any(AbortSignal),
+      { toolTimeoutMs: 10_000 }
+    );
+  });
+
+  it("still closes the Pi-owned session when the browser was only used through bash", async () => {
+    runMock.mockResolvedValue({
+      stdout: "No live pire-browser Firefox session to close.",
+      stderr: "",
+      exitCode: 0,
+      finishReason: "close",
+      timedOut: false,
+      recovered: false,
+    });
+    const { handlers } = registerTool();
+    handlers.get("session_start")?.({}, { sessionManager: { getSessionId: () => "pi-session" } });
+
+    await handlers.get("session_shutdown")?.({}, {});
+
+    expect(runMock).toHaveBeenCalledWith(
+      expect.any(String),
+      expect.arrayContaining(["--session", "pi-session", "close"]),
+      expect.any(AbortSignal),
+      { toolTimeoutMs: 10_000 }
+    );
+  });
+});
+
+describe("pire-browser session remnant cleanup", () => {
+  it("kills surviving browsers for the closed profile and removes the directory", async () => {
+    const root = mkdtempSync(join(tmpdir(), "pire-remnants-"));
+    const sessionDir = join(root, "session-1");
+    const profile = join(sessionDir, "profile");
+    mkdirSync(profile, { recursive: true });
+    const killed: number[] = [];
+
+    const result = await terminateSessionRemnants(profile, {
+      listProcesses: () => [
+        { pid: 111, command: `firefox -profile ${profile}` },
+        { pid: 222, command: `firefox -profile /elsewhere/profile` },
+      ],
+      killProcess: (pid) => killed.push(pid),
+    });
+
+    expect(killed).toEqual([111]);
+    expect(result).toEqual({ killed: [111], removed: true });
+    expect(existsSync(sessionDir)).toBe(false);
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  it("leaves other sessions alone", async () => {
+    const root = mkdtempSync(join(tmpdir(), "pire-remnants-other-"));
+    const sessionDir = join(root, "session-2");
+    const profile = join(sessionDir, "profile");
+    mkdirSync(profile, { recursive: true });
+
+    const result = await terminateSessionRemnants(profile, {
+      listProcesses: () => [{ pid: 333, command: `firefox -profile /other/session/profile` }],
+      killProcess: () => undefined,
+    });
+
+    expect(result.killed).toEqual([]);
+    rmSync(root, { recursive: true, force: true });
+  });
+});
+
+describe("pire-browser stale session reaper", () => {
+  const marker = ".pire-browser-session.json";
+
+  function fixture() {
+    const root = mkdtempSync(join(tmpdir(), "pire-reaper-"));
+    const sessions = join(root, "default", "sessions");
+    mkdirSync(sessions, { recursive: true });
+    return { root, sessions };
+  }
+
+  function makeSession(sessions: string, id: string, options: { marker?: boolean; ageMs?: number } = {}) {
+    const directory = join(sessions, id);
+    mkdirSync(join(directory, "profile"), { recursive: true });
+    if (options.marker) writeFileSync(join(directory, marker), "{}");
+    const when = new Date(Date.now() - (options.ageMs ?? 60 * 60_000));
+    utimesSync(directory, when, when);
+    return directory;
+  }
+
+  it("removes unmarked stale sessions and kills their browser", async () => {
+    const { root, sessions } = fixture();
+    const stale = makeSession(sessions, "stale-1");
+    const killed: number[] = [];
+
+    const result = await reapStaleBrowserSessions({
+      sessionsRoot: root,
+      listLiveProfiles: async () => [],
+      listProcesses: () => [{ pid: 4242, command: `firefox -profile ${join(stale, "profile")}` }],
+      killProcess: (pid) => killed.push(pid),
+    });
+
+    expect(killed).toEqual([4242]);
+    expect(existsSync(stale)).toBe(false);
+    expect(result.killed).toEqual([4242]);
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  it("keeps marked sessions and sessions that are still starting up", async () => {
+    const { root, sessions } = fixture();
+    const live = makeSession(sessions, "live-1", { marker: true });
+    const starting = makeSession(sessions, "starting-1", { ageMs: 0 });
+
+    const result = await reapStaleBrowserSessions({
+      sessionsRoot: root,
+      listLiveProfiles: async () => [],
+      listProcesses: () => [],
+    });
+
+    expect(result.removed).toEqual([]);
+    expect(existsSync(live)).toBe(true);
+    expect(existsSync(starting)).toBe(true);
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  it("keeps a registered live session even when its ownership marker is gone", async () => {
+    const { root, sessions } = fixture();
+    const unmarkedLive = makeSession(sessions, "unmarked-live-1");
+    const killed: number[] = [];
+
+    const result = await reapStaleBrowserSessions({
+      sessionsRoot: root,
+      listLiveProfiles: async () => [join(unmarkedLive, "profile")],
+      listProcesses: () => [{ pid: 5150, command: `firefox -profile ${join(unmarkedLive, "profile")}` }],
+      killProcess: (pid) => killed.push(pid),
+    });
+
+    expect(result).toEqual({ removed: [], killed: [] });
+    expect(killed).toEqual([]);
+    expect(existsSync(unmarkedLive)).toBe(true);
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  it("does nothing when liveness cannot be determined", async () => {
+    const { root, sessions } = fixture();
+    const stale = makeSession(sessions, "stale-unknown-liveness");
+
+    const result = await reapStaleBrowserSessions({
+      sessionsRoot: root,
+      listLiveProfiles: async () => {
+        throw new Error("session list failed");
+      },
+      listProcesses: () => [],
+    });
+
+    expect(result).toEqual({ removed: [], killed: [] });
+    expect(existsSync(stale)).toBe(true);
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  it("respects the disable switch", async () => {
+    const { root, sessions } = fixture();
+    const stale = makeSession(sessions, "stale-2");
+    process.env.PIRE_BROWSER_PI_DISABLE_REAPER = "1";
+
+    try {
+      const result = await reapStaleBrowserSessions({
+        sessionsRoot: root,
+        listLiveProfiles: async () => [],
+        listProcesses: () => [],
+      });
+      expect(result.removed).toEqual([]);
+      expect(existsSync(stale)).toBe(true);
+    } finally {
+      delete process.env.PIRE_BROWSER_PI_DISABLE_REAPER;
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 });

@@ -1,4 +1,6 @@
-import { existsSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { existsSync, readdirSync, rmSync, statSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -35,6 +37,12 @@ const SESSIONLESS_COMMANDS = new Set([
   "version",
 ]);
 const SESSION_CLOSE_TIMEOUT_MS = 10_000;
+const SESSION_MARKER_FILE = ".pire-browser-session.json";
+const STALE_SESSION_MIN_AGE_MS = 10 * 60_000;
+const REAPER_DISABLE_ENV = "PIRE_BROWSER_PI_DISABLE_REAPER";
+const SESSIONS_ROOT_ENV = "PIRE_BROWSER_SESSIONS_ROOT";
+const LIVE_SESSION_QUERY_TIMEOUT_MS = 15_000;
+const SESSION_SETTLE_MS = 500;
 
 export default function (pi: ExtensionAPI) {
   let piSessionId: string | undefined;
@@ -43,19 +51,30 @@ export default function (pi: ExtensionAPI) {
   pi.on("session_start", (_event, ctx) => {
     piSessionId = ctx.sessionManager.getSessionId();
     currentSessionWasUsed = false;
+    void reapStaleBrowserSessions();
   });
 
   pi.on("session_shutdown", async () => {
     const sessionId = piSessionId;
     piSessionId = undefined;
-    if (!sessionId || !currentSessionWasUsed) return;
-
     currentSessionWasUsed = false;
+    if (!sessionId) return;
+
+    // Capture our own profile path before closing: `close` deregisters the
+    // session and can leave Firefox running, and afterwards the path is gone
+    // from the live registry.
+    const ownedProfile = await ownedSessionProfilePath(sessionId);
+
+    // Unconditional cleanup: closing a session that was never created is a safe
+    // no-op, and this extension cannot observe browser work done outside its tool.
     const command = resolveCommand();
     const controller = new AbortController();
     await run(command.executable, [...command.args, "--session", sessionId, "close"], controller.signal, {
       toolTimeoutMs: SESSION_CLOSE_TIMEOUT_MS,
     });
+
+    if (ownedProfile) await terminateSessionRemnants(ownedProfile);
+    await reapStaleBrowserSessions();
   });
 
   const register = (name: "pire-browser" | "pire_browser") =>
@@ -170,6 +189,211 @@ function isSessionlessCommand(args: string[]) {
 
 function isCloseCommand(args: string[]) {
   return args.some((arg) => arg === "close" || arg === "quit" || arg === "exit");
+}
+
+export type ReaperOptions = {
+  sessionsRoot?: string;
+  minAgeMs?: number;
+  now?: number;
+  listLiveProfiles?: () => Promise<string[]>;
+  listProcesses?: () => Array<{ pid: number; command: string }>;
+  killProcess?: (pid: number) => void;
+  removeDirectory?: (path: string) => void;
+  settleMs?: number;
+};
+
+/**
+ * Remove abandoned pire-browser temporary session leftovers.
+ *
+ * Liveness comes from the live session registry, not from the ownership marker:
+ * a session whose marker was already deleted can still be registered and in use.
+ * Liveness is also authoritative over the age guard, so a long-running session is
+ * never reaped. When liveness cannot be determined, nothing is reaped at all.
+ */
+export async function reapStaleBrowserSessions(options: ReaperOptions = {}) {
+  const empty = { removed: [] as string[], killed: [] as number[] };
+  if (process.env[REAPER_DISABLE_ENV]) return empty;
+  const root = options.sessionsRoot ?? process.env[SESSIONS_ROOT_ENV] ?? defaultSessionsRoot();
+  if (!root || !existsSync(root)) return empty;
+
+  let liveProfiles: string[];
+  try {
+    liveProfiles = await (options.listLiveProfiles ?? liveSessionProfiles)();
+  } catch {
+    // Fail closed: without a trustworthy live-session view, reaping could close
+    // a browser that another Pi session is actively using.
+    return empty;
+  }
+  const live = new Set(liveProfiles.map(normalizeProfilePath));
+
+  const staleDirectories = staleSessionDirectories(
+    root,
+    (options.now ?? Date.now()) - (options.minAgeMs ?? STALE_SESSION_MIN_AGE_MS),
+    live
+  );
+  if (staleDirectories.length === 0) return empty;
+
+  const removed: string[] = [];
+  const killed: number[] = [];
+  const kill = options.killProcess ?? terminateProcess;
+  const remove = options.removeDirectory ?? ((path: string) => rmSync(path, { recursive: true, force: true }));
+  const staleProfiles = staleDirectories.map((directory) => join(directory, "profile"));
+
+  for (const entry of (options.listProcesses ?? listProcesses)()) {
+    if (entry.pid === process.pid) continue;
+    if (!staleProfiles.some((profile) => entry.command.includes(profile))) continue;
+    try {
+      kill(entry.pid);
+      killed.push(entry.pid);
+    } catch {
+      // Best effort: a process may exit between listing and signalling.
+    }
+  }
+
+  for (const directory of staleDirectories) {
+    try {
+      remove(directory);
+      removed.push(directory);
+    } catch {
+      // Best effort: keep the session usable if removal is not permitted.
+    }
+  }
+
+  return { removed, killed };
+}
+
+function staleSessionDirectories(root: string, cutoff: number, live: Set<string>) {
+  const stale: string[] = [];
+  for (const namespace of readDirectoryNames(root)) {
+    const sessionsDir = join(root, namespace, "sessions");
+    for (const id of readDirectoryNames(sessionsDir)) {
+      const directory = join(sessionsDir, id);
+      if (live.has(normalizeProfilePath(join(directory, "profile")))) continue;
+      if (existsSync(join(directory, SESSION_MARKER_FILE))) continue;
+      try {
+        if (statSync(directory).mtimeMs > cutoff) continue;
+      } catch {
+        continue;
+      }
+      stale.push(directory);
+    }
+  }
+  return stale;
+}
+
+function normalizeProfilePath(path: string) {
+  return path.replace(/[\\/]+$/, "");
+}
+
+async function liveSessionProfiles() {
+  const sessions = await queryLiveSessions();
+  return sessions
+    .map((session) => session.profilePath)
+    .filter((path): path is string => typeof path === "string" && path.length > 0);
+}
+
+type LiveSession = { sessionName?: unknown; profilePath?: unknown };
+
+async function queryLiveSessions(): Promise<LiveSession[]> {
+  const command = resolveCommand();
+  const result = await run(
+    command.executable,
+    [...command.args, "session", "list", "--json"],
+    new AbortController().signal,
+    { toolTimeoutMs: LIVE_SESSION_QUERY_TIMEOUT_MS }
+  );
+  if (result.exitCode !== 0 || result.timedOut) throw new Error("live session query failed");
+  const parsed = JSON.parse(result.stdout) as { data?: { liveSessions?: unknown } };
+  const sessions = parsed?.data?.liveSessions;
+  if (!Array.isArray(sessions)) throw new Error("unexpected session list payload");
+  return sessions as LiveSession[];
+}
+
+async function ownedSessionProfilePath(sessionId: string) {
+  try {
+    const sessions = await queryLiveSessions();
+    const owned = sessions.find(
+      (session) => session.sessionName === sessionId || session.sessionName === `pi-${sessionId}`
+    );
+    return typeof owned?.profilePath === "string" ? owned.profilePath : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Terminate browser processes still holding a session profile that was just
+ * closed, then remove the abandoned session directory. `pire-browser close`
+ * deregisters the session but does not reliably stop Firefox, which is how
+ * untracked windows pile up.
+ */
+export async function terminateSessionRemnants(profilePath: string, options: ReaperOptions = {}) {
+  const killed: number[] = [];
+  const kill = options.killProcess ?? terminateProcess;
+
+  for (const entry of (options.listProcesses ?? listProcesses)()) {
+    if (entry.pid === process.pid) continue;
+    if (!entry.command.includes(profilePath)) continue;
+    try {
+      kill(entry.pid);
+      killed.push(entry.pid);
+    } catch {
+      // Best effort: the process may already be exiting.
+    }
+  }
+
+  if (killed.length > 0) {
+    await delay(options.settleMs ?? (options.killProcess ? 0 : SESSION_SETTLE_MS));
+  }
+
+  let removed = false;
+  try {
+    (options.removeDirectory ?? ((path: string) => rmSync(path, { recursive: true, force: true })))(
+      dirname(profilePath)
+    );
+    removed = true;
+  } catch {
+    // Best effort: leave the directory for the stale-session reaper.
+  }
+
+  return { killed, removed };
+}
+
+function delay(ms: number) {
+  return new Promise((resolve) => {
+    const timer = setTimeout(resolve, ms);
+    (timer as { unref?: () => void }).unref?.();
+  });
+}
+
+function readDirectoryNames(path: string) {
+  try {
+    return readdirSync(path, { withFileTypes: true }).filter((entry) => entry.isDirectory()).map((entry) => entry.name);
+  } catch {
+    return [];
+  }
+}
+
+function defaultSessionsRoot() {
+  if (process.platform !== "darwin" && process.platform !== "linux") return undefined;
+  return join(tmpdir(), "pire-browser");
+}
+
+function listProcesses() {
+  const output = execFileSync("ps", ["-axo", "pid=,command="], { encoding: "utf8", maxBuffer: 32 * 1024 * 1024 });
+  return output
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .map((line) => {
+      const match = /^(\d+)\s+(.*)$/.exec(line);
+      return match ? { pid: Number.parseInt(match[1], 10), command: match[2] } : null;
+    })
+    .filter((entry): entry is { pid: number; command: string } => entry !== null);
+}
+
+function terminateProcess(pid: number) {
+  process.kill(pid, "SIGTERM");
 }
 
 export function isConfirmationRequiredResult(
