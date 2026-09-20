@@ -5,7 +5,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::thread;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -3412,7 +3412,11 @@ Path={}
         fs::write(source.join("sessionstore.jsonlz4"), b"tabs").unwrap();
         fs::write(source.join("storage/default/app/state.sqlite"), b"state").unwrap();
         fs::write(source.join("storage/default/app/idb/state.sqlite"), b"idb").unwrap();
-        fs::write(source.join("storage/default/example.com/cache/entry"), b"cache").unwrap();
+        fs::write(
+            source.join("storage/default/example.com/cache/entry"),
+            b"cache",
+        )
+        .unwrap();
         fs::write(source.join("cache2/ignored"), b"cache").unwrap();
         fs::write(source.join("jumpListCache/ignored"), b"jump").unwrap();
         fs::write(source.join("security_state/ignored"), b"hsts").unwrap();
@@ -3441,14 +3445,19 @@ Path={}
             fs::read(destination.join("storage/default/app/idb/state.sqlite")).unwrap(),
             b"idb"
         );
-        assert_eq!(fs::read(destination.join("extensions/keep.xpi")).unwrap(), b"xpi");
+        assert_eq!(
+            fs::read(destination.join("extensions/keep.xpi")).unwrap(),
+            b"xpi"
+        );
         assert!(!destination.join("parent.lock").exists());
         assert!(!destination.join("cache2").exists());
         assert!(!destination.join("jumpListCache").exists());
         assert!(!destination.join("security_state").exists());
         assert!(!destination.join("favicons.sqlite").exists());
         assert!(!destination.join("sessionstore.jsonlz4").exists());
-        assert!(!destination.join("storage/default/example.com/cache").exists());
+        assert!(!destination
+            .join("storage/default/example.com/cache")
+            .exists());
     }
 
     #[test]
