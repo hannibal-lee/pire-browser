@@ -59,7 +59,7 @@ pire-browser --session "$SESSION" close
 
 # Later runs use the compact restore state without copying the source again:
 pire-browser --session "$SESSION" --restore open http://localhost:3000/app`),
-  p("When an app needs existing Firefox login state, list discovered profiles and use the profile name as a temporary snapshot source on the first run. Close desktop Firefox first if the source is locked. Later runs can use compact restore without recopying the source. Use an explicit <code>--profile &lt;path&gt;</code> instead when IndexedDB, service workers, history, or full Firefox state must persist."),
+  p("When an app needs existing Firefox login state, list discovered profiles and use the profile name as a temporary snapshot source on the first run. Close desktop Firefox first if that source profile is active. A stale lock artifact without a matching Firefox process does not block the snapshot. Later runs can use compact restore without recopying the source. Use an explicit <code>--profile &lt;path&gt;</code> instead when IndexedDB, service workers, history, or full Firefox state must persist."),
   h2("Common commands", "common-commands"),
   code(`pire-browser open                         # Launch/reuse Firefox without navigating
 pire-browser open https://example.com

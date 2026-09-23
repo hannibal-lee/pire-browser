@@ -800,15 +800,20 @@ fn resolve_named_profile_source(root: &Path, requested: &str) -> Result<(String,
 }
 
 fn ensure_profile_source_is_unlocked(source: &Path) -> Result<()> {
-    for lock_name in ["parent.lock", ".parentlock", "lock"] {
-        if source.join(lock_name).exists() {
-            bail!(
-                "profile_locked: Firefox profile {} appears to be in use; close Firefox before taking a snapshot",
-                source.display()
-            );
-        }
+    if profile_source_is_actively_locked(source, profile_processes_are_alive) {
+        bail!(
+            "profile_locked: Firefox profile {} appears to be in use; close Firefox before taking a snapshot",
+            source.display()
+        );
     }
     Ok(())
+}
+
+fn profile_source_is_actively_locked(
+    source: &Path,
+    has_profile_process: impl FnOnce(&Path) -> bool,
+) -> bool {
+    source_has_lock_file(source) && has_profile_process(source)
 }
 
 fn profile_value_is_path_like(value: &str) -> bool {
@@ -1528,7 +1533,7 @@ pub fn import_firefox_profile(options: ProfileImportOptions) -> Result<ProfileIm
         );
     }
     validate_firefox_profile_source(&source)?;
-    if source_has_lock_file(&source) {
+    if profile_source_is_actively_locked(&source, profile_processes_are_alive) {
         bail!(
             "profile_in_use: source profile {} appears to be in use; close Firefox before importing it",
             source.display()
@@ -3292,6 +3297,8 @@ mod tests {
 
         fs::write(source.join("parent.lock"), b"locked").unwrap();
         assert!(source_has_lock_file(&source));
+        assert!(!profile_source_is_actively_locked(&source, |_| false));
+        assert!(profile_source_is_actively_locked(&source, |_| true));
     }
 
     #[test]

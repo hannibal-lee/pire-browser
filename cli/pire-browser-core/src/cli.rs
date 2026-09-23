@@ -4872,7 +4872,7 @@ snapshot. Discovered Firefox entries come from Mozilla `profiles.ini` files.
 `profiles import` copies an existing Firefox profile directory, or a discovered
 Firefox profile name such as `default-release` or `Default`, into a managed
 pire-browser profile. It never mutates the source profile and future changes in
-the source do not sync. Close Firefox before importing so lock files and
+the source do not sync. Close Firefox before importing an active source so
 partially-written profile data are not copied. Pass `--overwrite` to replace an
 existing stopped legacy profile.
 

@@ -27,7 +27,7 @@ pire-browser --session "$SESSION" close
 ```
 
 For the first run with existing Firefox cookies, inspect `pire-browser profiles`,
-ask the user to close Firefox if the source is locked, then run:
+ask the user to close Firefox if the source profile is active, then run:
 
 ```bash
 pire-browser --profile Default --session "$SESSION" --restore open <url>
